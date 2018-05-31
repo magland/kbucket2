@@ -103,8 +103,11 @@ app.use('/web', express.static(__dirname + '/web'))
 
 function handle_find(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
-        allow_cross_domain_requests(res);
-    } else if ((req.method == 'GET')||(req.method == 'POST')) {
+        allow_cross_domain_requests_for_options(res);
+        return;
+    }
+    allow_cross_domain_requests(res);
+    if ((req.method == 'GET')||(req.method == 'POST')) {
         manager.findFile({
             sha1: sha1,
             filename: filename //only used for convenience in appending the url, not for finding the file
@@ -135,8 +138,11 @@ function handle_find(sha1,filename,req,res) {
 
 function handle_download(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
-        allow_cross_domain_requests(res);
-    } else if (req.method == 'GET') {
+        allow_cross_domain_requests_for_options(res);
+        return;
+    }
+    allow_cross_domain_requests(res);
+    if (req.method == 'GET') {
         console.log (`download: sha1=${sha1}`)
 
         if (!is_valid_sha1(params.sha1)) {
@@ -155,8 +161,11 @@ function handle_download(sha1,filename,req,res) {
 
 function handle_proxy_download(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
-        allow_cross_domain_requests(res);
-    } else if (req.method == 'GET') {
+        allow_cross_domain_requests_for_options(res);
+        return;
+    }
+    allow_cross_domain_requests(res);
+    if (req.method == 'GET') {
         console.log (`proxy-download: sha1=${sha1}`)
 
         if (!is_valid_sha1(sha1)) {
@@ -199,7 +208,11 @@ function handle_proxy_download(sha1,filename,req,res) {
 }
 
 function handle_forward_to_share(share_key,method,path,req,res) {
-	//allow_cross_domain_requests(res);
+	if (req.method == 'OPTIONS') {
+        allow_cross_domain_requests_for_options(res);
+        return;
+    }
+    allow_cross_domain_requests(res);
 	var SS=manager.shareManager().getShare(share_key);
 	if (!SS) {
 		res.json({success:false,error:`Unable to find share with key=${share_key}`});
@@ -208,7 +221,7 @@ function handle_forward_to_share(share_key,method,path,req,res) {
 	SS.processHttpRequest(method,path,req,res);
 }
 
-function allow_cross_domain_requests(res) {
+function allow_cross_domain_requests_for_options(res) {
     //allow cross-domain requests
     res.set('Access-Control-Allow-Origin', '*');
     res.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
@@ -217,6 +230,11 @@ function allow_cross_domain_requests(res) {
     res.set("Access-Control-Allow-Headers", "X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept, Authorization, Range");
     res.status(200).send();
     return;
+}
+
+function allow_cross_domain_requests(res) {
+	res.header("Access-Control-Allow-Origin", "*");
+ 	res.set("Access-Control-Allow-Headers", "X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept, Authorization, Range");
 }
 
 async.series([
