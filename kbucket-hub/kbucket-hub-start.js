@@ -104,7 +104,7 @@ app.use('/web', express.static(__dirname + '/web'))
 function handle_find(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
         allow_cross_domain_requests(res);
-    } else if (req.method == 'GET') {        
+    } else if ((req.method == 'GET')||(req.method == 'POST')) {
         manager.findFile({
             sha1: sha1,
             filename: filename //only used for convenience in appending the url, not for finding the file
