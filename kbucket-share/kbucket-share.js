@@ -38,6 +38,7 @@ KBUCKET_SHARE_PROTOCOL=${KBUCKET_SHARE_PROTOCOL}
 KBUCKET_SHARE_HOST=${KBUCKET_SHARE_HOST}
 KBUCKET_SHARE_PORT_RANGE=${KBUCKET_SHARE_PORT_RANGE}
 KBUCKET_SHARE_KEY=${KBUCKET_SHARE_KEY}
+debugging=${debugging}
 
 Sharing directory: ${share_directory}
 
@@ -212,6 +213,7 @@ function HttpRequest(on_message_handler) {
       headers:msg.headers,
       followRedirect:false // important because we want the proxy server to handle it instead
     }
+    console.log('request',opts);
     m_request=request(opts);
     m_request.on('response',function(resp) {
       on_message_handler({command:'http_set_response_headers',status:resp.statusCode,status_message:resp.statusMessage,headers:resp.headers});
@@ -265,7 +267,10 @@ function connect_to_websocket() {
   if (KBUCKET_HUB_URL) {
     var URL=require('url').URL;
     var url=new URL(KBUCKET_HUB_URL);
-    url.protocol='ws';
+    if (url.protocol=='http')
+      url.protocol='ws';
+    else
+      url.protocol='wss';
     url=url.toString();
     const ws = new WebSocket(url, {
       perMessageDeflate: false

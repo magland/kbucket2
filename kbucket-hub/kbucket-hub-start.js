@@ -762,7 +762,8 @@ function KBucketHubManager() {
 		}
 		callback(null,{
 			size:stat.size,
-			url:url0
+			url:url0,
+			found:true
 		});
 	}
 	function find_file_on_shares(opts,callback) {
