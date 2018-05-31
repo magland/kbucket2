@@ -2,15 +2,20 @@ require('dotenv').config({
     path: __dirname + '/../.env'
 });
 
+const debugging=(process.env.DEBUG=='true');
+
 const fs=require('fs');
 const express=require('express');
 const request=require('request');
 const async = require('async');
 const WebSocket = require('ws');
+const findPort = require('find-port');
 
 const KBUCKET_HUB_URL=process.env.KBUCKET_HUB_URL||'https://kbucket.flatironinstitute.org';
-const KBUCKET_SHARE_HOST=process.env.KBUCKET_SHARE_HOST||'http://localhost';
-const KBUCKET_SHARE_PORTS=process.env.KBUCKET_SHARE_PORT||process.env.KBUCKET_SHARE_PORTS||4120;
+const KBUCKET_SHARE_PROTOCOL='http'; //todo: support https
+const KBUCKET_SHARE_HOST=process.env.KBUCKET_SHARE_HOST||'localhost';
+const KBUCKET_SHARE_PORT_RANGE=process.env.KBUCKET_SHARE_PORT||process.env.KBUCKET_SHARE_PORT_RANGE||'12000-13000';
+var KBUCKET_SHARE_PORT=undefined; //determined below
 
 var CLP=new CLParams(process.argv);
 
@@ -24,14 +29,14 @@ if (!fs.statSync(share_directory).isDirectory()) {
   console.error('Not a directory: '+share_directory);
   process.exit(-1);
 }
-var KBUCKET_SHARE_PORT=KBUCKET_SHARE_PORTS; // TODO: assign open port if this is a range
 var KBUCKET_SHARE_KEY=process.env.KBUCKET_SHARE_KEY||make_random_id(8);
 
 console.log (`
 Using the following:
 KBUCKET_HUB_URL=${KBUCKET_HUB_URL}
+KBUCKET_SHARE_PROTOCOL=${KBUCKET_SHARE_PROTOCOL}
 KBUCKET_SHARE_HOST=${KBUCKET_SHARE_HOST}
-KBUCKET_SHARE_PORT=${KBUCKET_SHARE_PORT}
+KBUCKET_SHARE_PORT_RANGE=${KBUCKET_SHARE_PORT_RANGE}
 KBUCKET_SHARE_KEY=${KBUCKET_SHARE_KEY}
 
 Sharing directory: ${share_directory}
@@ -47,7 +52,6 @@ app.set('json spaces', 4); // when we respond with json, this is how it will be 
 app.get('/:share_key/api/readdir/:subdirectory(*)',function(req,res) {
   if (!check_share_key(req,res)) return;
   var params=req.params;
-  console.log(params);
   handle_readdir(params.subdirectory,req,res);
 });
 app.get('/:share_key/api/readdir/',function(req,res) {
@@ -149,10 +153,37 @@ function is_safe_path(path) {
 }
 
 function start_server(callback) {
-  app.listen(KBUCKET_SHARE_PORT, function() {
-    console.log (`Listening on port ${KBUCKET_SHARE_PORT}`);
-    console.log (`Web interface: ${KBUCKET_SHARE_HOST}:${KBUCKET_SHARE_PORT}/${KBUCKET_SHARE_KEY}/web`)
-    connect_to_websocket();
+  get_free_port_in_range(KBUCKET_SHARE_PORT_RANGE.split('-'),function(err,port) {
+    KBUCKET_SHARE_PORT=port;
+    app.listen(KBUCKET_SHARE_PORT, function() {
+      console.log (`Listening on port ${KBUCKET_SHARE_PORT}`);
+      console.log (`Web interface: ${KBUCKET_SHARE_PROTOCOL}://${KBUCKET_SHARE_HOST}:${KBUCKET_SHARE_PORT}/${KBUCKET_SHARE_KEY}/web`)
+      connect_to_websocket();
+    });
+  });
+}
+
+function get_free_port_in_range(range,callback) {
+  var findPort = require('find-port');
+  if (range.length>2) {
+    callback('Invalid port range.');
+    return;
+  }
+  if (range.length<1) {
+    callback('Invalid port range (*).');
+    return;
+  }
+  if (range.length==1) {
+    range.push(range[0]);
+  }
+  range[0]=Number(range[0]);
+  range[1]=Number(range[1]);
+  findPort('127.0.0.1', range[0], range[1], function(ports) {
+      if (ports.length==0) {
+        callback(`No free ports found in range ${range[0]}-${range[1]}`);
+        return;
+      }
+      callback(null,ports[0]);
   });
 }
 
@@ -178,13 +209,13 @@ function HttpRequest(on_message_handler) {
     var opts={
       method:msg.method,
       uri:`http://localhost:${KBUCKET_SHARE_PORT}/${msg.path}`,
-      headers:msg.headers
+      headers:msg.headers,
+      followRedirect:false // important because we want the proxy server to handle it instead
     }
-    console.log('opts:',opts);
+    console.log('opts for request',opts);
     m_request=request(opts);
     m_request.on('response',function(resp) {
-      console.log('on_response');
-      on_message_handler({command:'http_set_response_headers',headers:resp.headers});
+      on_message_handler({command:'http_set_response_headers',status:resp.statusCode,status_message:resp.statusMessage,headers:resp.headers});
       resp.on('error',on_response_error);
       resp.on('data',on_response_data);
       resp.on('end',on_response_end);
@@ -211,7 +242,6 @@ function HttpRequest(on_message_handler) {
   }
 
   function on_response_data(data) {
-    console.log('on_response_data');
     on_message_handler({
       command:'http_write_response_data',
       data_base64:data.toString('base64')
@@ -219,14 +249,12 @@ function HttpRequest(on_message_handler) {
   }
 
   function on_response_end() {
-    console.log('on_response_end');
     on_message_handler({
       command:'http_end_response'
     });
   }
 
   function on_response_error(err) {
-    console.log('on_response_error');
     on_message_handler({
       command:'http_report_error',
       error:'Error in response: '+err.message
@@ -246,9 +274,19 @@ function connect_to_websocket() {
     ws.on('open', function open() {
       send_message_to_hub({
         command:'register_kbucket_share',
-        share_host:KBUCKET_SHARE_HOST,
-        share_port:KBUCKET_SHARE_PORT
+        info:{
+          share_protocol:KBUCKET_SHARE_PROTOCOL,
+          share_host:KBUCKET_SHARE_HOST,
+          share_port:KBUCKET_SHARE_PORT
+        }
       });
+      index_files();
+    });
+    ws.on('close',function() {
+      if (debugging) {
+        console.log (`Websocket closed. Aborting.`);
+      }
+      process.exit(-1);
     });
     ws.on('message', (message_str) => {
       var msg=parse_json(message_str);
@@ -257,8 +295,10 @@ function connect_to_websocket() {
         ws.close();
         return;
       }
-      console.log('====================================== received message');
-      console.log(JSON.stringify(msg,null,4));
+      if (debugging) {
+        console.log ('====================================== received message');
+        console.log (JSON.stringify(msg,null,4).slice(0,400));
+      }
 
       if (msg.command=='http_initiate_request') {
         if (msg.request_id in HTTP_REQUESTS) {
@@ -297,20 +337,138 @@ function connect_to_websocket() {
         return;  
       }
     });
+
+    function index_files() {
+      index_files_in_subdirectory('',function(err) {
+        if (err) {
+          console.error(`Error computing prv index: ${err}. Aborting.`);
+          process.exit(-1);
+        }
+      });
+    }
+
+    function index_files_in_subdirectory(subdirectory,callback) {
+      var path0=require('path').join(share_directory,subdirectory);
+      fs.readdir(path0,function(err,list) {
+        if (err) {
+          callback(err.message);
+          return;
+        }
+        var filepaths=[],dirpaths=[];
+        async.eachSeries(list,function(item,cb) {
+          if ((item=='.')||(item=='..')) {
+            cb();
+            return;
+          }
+          fs.stat(require('path').join(path0,item),function(err0,stat0) {
+            if (err0) {
+              callback(`Error in stat of file ${item}: ${err0.message}`);
+              return;
+            }
+            if (stat0.isFile()) {
+              filepaths.push(require('path').join(subdirectory,item));
+            }
+            else if (stat0.isDirectory()) {
+              dirpaths.push(require('path').join(subdirectory,item));
+            }
+            cb();
+          });
+        },function() {
+          index_files_list(filepaths,function(err) {
+            if (err) {
+              callback(err);
+              return;
+            }
+            async.eachSeries(dirpaths,function(dirpath,cb) {
+              index_files_in_subdirectory(dirpath,function(err) {
+                if (err) {
+                  callback(err);
+                  return;
+                }
+                cb();
+              });
+            },function() {
+              callback(null);
+            });
+          });
+        });
+      });
+    }
+
+    function index_files_list(filepaths,callback) {
+      async.eachSeries(filepaths,function(filepath,cb) {
+        var path0=require('path').join(share_directory,filepath);
+        console.log(`Computing prv for: ${filepath}...`);
+        compute_prv(path0,function(err,prv) {
+          if (err) {
+            callback(err);
+            return;
+          }
+          send_message_to_hub({command:'set_file_info',path:filepath,prv:prv});
+          cb();
+        });
+      },function() {
+        callback(null);
+      });
+    }
+
+    function compute_prv(path,callback) {
+      var cmd=`ml-prv-stat ${path}`;
+      run_command_and_read_stdout(cmd,function(err,txt) {
+        if (err) {
+          callback(err);
+          return;
+        }
+        var obj=parse_json(txt.trim());
+        if (!obj) {
+          callback(`Error parsing json output in compute_prv for file: ${path}`);
+          return;
+        }
+        callback(null,obj);
+      });
+    }
+
+
     function send_message_to_hub(obj) {
       obj.share_key=KBUCKET_SHARE_KEY;
       send_json_message(obj);
     }
     function send_json_message(obj) {
-      console.log('------------------------------- sending message');
-      console.log(JSON.stringify(obj,null,4));
+      if (debugging) {
+        if (obj.command!='set_file_info') {
+          console.log ('------------------------------- sending message');
+          console.log (JSON.stringify(obj,null,4).slice(0,400));
+        }
+      }
       ws.send(JSON.stringify(obj));
     }
+
   }
 }
 
 start_server();
 
+
+function run_command_and_read_stdout(cmd,callback) {
+  var P;
+  try {
+    P=require('child_process').spawn(cmd,{shell:true});
+  }
+  catch(err) {
+    callback(`Problem launching ${cmd}: ${err.message}`);
+    return;
+  }
+  var txt='';
+  P.stdout.on('data',function(chunk) {
+    txt+=chunk.toString();
+  });
+  P.on('close',function(code) {
+    callback(null,txt);
+  });
+  P.on('error',function(err) {
+    callback(`Problem running ${cmd}: ${err.message}`);
+  })
+}
 
 
 function CLParams(argv) {

@@ -8,9 +8,11 @@ PORT
 KBUCKET_DATA_DIRECTORY
 MAX_UPLOAD_SIZE_MB
 KBUCKET_HUB_URL
+DEBUG (use 'true')
 */
 
-var KHM = new KBucketHubManager();
+const manager = new KBucketHubManager();
+const debugging=(process.env.DEBUG=='true');
 
 const async = require('async');
 const request = require('request');
@@ -50,14 +52,14 @@ mkdir_if_needed(RAW_DIRECTORY);
 mkdir_if_needed(UPLOADS_IN_PROGRESS_DIRECTORY);
 
 // API find
-app.use('/find/:sha1', function(req, res) {
-	var params = req.params;
-	handle_find(params.sha1,'',req,res);
-});
 app.use('/find/:sha1/:filename(*)', function(req, res) {
 	// Note: filename is just for convenience, only used in forming download urls
 	var params = req.params;
 	handle_find(params.sha1,params.filename,req,res);
+});
+app.use('/find/:sha1', function(req, res) {
+	var params = req.params;
+	handle_find(params.sha1,'',req,res);
 });
 // Provide stat synonym for backward-compatibility)
 app.use('/stat/:sha1', function(req, res) {
@@ -66,20 +68,31 @@ app.use('/stat/:sha1', function(req, res) {
 });
 
 // API download (direct from kbucket hub)
-app.use('/download/:sha1', function(req, res) {
-	var params = req.params;
-	handle_download(params.sha1,params.sha1,req,res);
-});
 app.use('/download/:sha1/:filename(*)', function(req, res) {
 	// Note: filename is just for convenience, not actually used
 	var params = req.params;
 	handle_download(params.sha1,params.filename,req,res);
+});
+app.use('/download/:sha1', function(req, res) {
+	var params = req.params;
+	handle_download(params.sha1,params.sha1,req,res);
 });
 
 // Forward http request to a kbucket share
 app.use('/share/:share_key/:path(*)', function(req, res) {
 	var params = req.params;
 	handle_forward_to_share(params.share_key,req.method,params.path,req,res);
+});
+
+// proxy download
+app.use('/proxy-download/:sha1/:filename(*)', function(req, res) {
+	// Note: filename is just for convenience, not actually used
+	var params = req.params;
+	handle_proxy_download(params.sha1,params.filename,req,res);
+});
+app.use('/proxy-download/:sha1',function(req,res) {
+	var params = req.params;
+	handle_proxy_download(params.sha1,params.sha1,req,res);
 });
 
 // API upload
@@ -92,11 +105,9 @@ function handle_find(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
         allow_cross_domain_requests(res);
     } else if (req.method == 'GET') {        
-        console.log(`find: sha1=${sha1}`)
-
-        KHM.findFile({
+        manager.findFile({
             sha1: sha1,
-            filename: filename
+            filename: filename //only used for convenience in appending the url, not for finding the file
         }, function(err, resp) {
             if (err) {
                 res.json({
@@ -109,8 +120,8 @@ function handle_find(sha1,filename,req,res) {
                     success: true,
                     found: true,
                     size: resp.size,
-                    direct_url: resp.direct_url,
-                    proxy_url: resp.proxy_url||''
+                    direct_urls: resp.direct_urls||undefined,
+                    proxy_url: resp.proxy_url||undefined
                 });
             }
         });
@@ -126,7 +137,7 @@ function handle_download(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
         allow_cross_domain_requests(res);
     } else if (req.method == 'GET') {
-        console.log (`download: sha1=${params.sha1}`)
+        console.log (`download: sha1=${sha1}`)
 
         if (!is_valid_sha1(params.sha1)) {
             const errstr = `Invalid sha1 for download: ${filename}`;
@@ -142,9 +153,54 @@ function handle_download(sha1,filename,req,res) {
     }
 }
 
+function handle_proxy_download(sha1,filename,req,res) {
+    if (req.method == 'OPTIONS') {
+        allow_cross_domain_requests(res);
+    } else if (req.method == 'GET') {
+        console.log (`proxy-download: sha1=${sha1}`)
+
+        if (!is_valid_sha1(sha1)) {
+            const errstr = `Invalid sha1 for download: ${filename}`;
+            console.error(errstr);
+            res.end(errstr);
+            return;
+        }
+
+        var path_to_file = RAW_DIRECTORY + '/' + sha1;
+        if (require('fs').existsSync(path_to_file)) {
+        	res.sendFile(path_to_file);
+        }
+        else {
+        	var opts={
+        		sha1:sha1,
+        		filename:filename
+        	};
+        	manager.shareManager().findFileOnShares(opts,function(err,resp) {
+        		if (err) {
+        			res.status(500).send({ error: 'Error in findFileOnShares' });
+        			return;
+        		}
+        		if ((!resp.internal_finds)||(resp.internal_finds.length==0)) {
+        			res.status(500).send({ error: 'Unable to find file on hub or on shares.' });
+        			return;
+        		}
+        		var internal_find=resp.internal_finds[0];
+        		var SS=manager.shareManager().getShare(internal_find.share_key);
+        		if (!SS) {
+        			res.status(500).send({ error: 'Unexpected problem 1 in handle_proxy_download' });
+        			return;	
+        		}
+        		SS.processHttpRequest(req.method,`download/${internal_find.path}`,req,res);
+        	});
+        }
+    } else {
+        res.end('Unsupported method: ' + req.method);
+    }
+}
+
 function handle_forward_to_share(share_key,method,path,req,res) {
 	//allow_cross_domain_requests(res);
-	var SS=KBSM.getShare(share_key);
+	var SS=manager.shareManager().getShare(share_key);
 	if (!SS) {
 		res.json({success:false,error:`Unable to find share with key=${share_key}`});
 		return;
@@ -171,12 +227,10 @@ function start_server(callback) {
     // Start Server
     app.server=require('http').createServer(app); //todo: support https when that is being used
     app.server.listen(PORT, function() {
-        console.log(`Listening on port ${PORT}`);
+        console.log (`Listening on port ${PORT}`);
         start_websocket_server();
     });
 }
-
-const KBSM=new KBShareManager();
 
 function start_websocket_server() {
 	//initialize the WebSocket server instance
@@ -186,8 +240,12 @@ function start_websocket_server() {
 		var share_key='';
 		ws.on('message', (message_str) => {
 			var msg=parse_json(message_str);
-			console.log('====================================== received message');
-			console.log(JSON.stringify(msg,null,4));
+			if (debugging) {
+				if (msg.command!='set_file_info') {
+					console.log ('====================================== received message');
+					console.log (JSON.stringify(msg,null,4).slice(0,500));
+				}
+			}
 			if (!msg) {
 				console.log ('Invalid message. Closing websocket connection.');
 				ws.close();
@@ -205,16 +263,16 @@ function start_websocket_server() {
 					return;
 				}
 				share_key=msg.share_key;
-				if (KBSM.getShare(share_key)) {
+				if (manager.shareManager().getShare(share_key)) {
 					console.log ('A share with this key already exists. Closing websocket connection.');
 					ws.close();
 					return;
 				}
-				console.log ('Registering',JSON.stringify(msg,null,4));
-				KBSM.addShare(share_key,send_message_to_share);
+				console.log (`Registering share: ${share_key}`);
+				manager.shareManager().addShare(share_key,msg.info,send_message_to_share);
 			}
 			else {
-				var SS=KBSM.getShare(share_key);
+				var SS=manager.shareManager().getShare(share_key);
 				if (!SS) {
 					console.log (`Unable to find share with key=${share_key}. Closing websocket connect.`);
 					ws.close();
@@ -234,8 +292,10 @@ function start_websocket_server() {
 		});
 
 		ws.on('close',function() {
-			console.log(`Websocket closed: share_key=${share_key}`);
-			KBSM.removeShare(share_key);
+			if (debugging) {
+				console.log (`Websocket closed: share_key=${share_key}`);
+			}
+			manager.shareManager().removeShare(share_key);
 		});
 
 		function send_message_to_share(obj) {
@@ -243,25 +303,28 @@ function start_websocket_server() {
 		}
 
 		function send_json_message(obj) {
-			console.log('------------------------------- sending message');
-			console.log(JSON.stringify(obj,null,4));
+			if (debugging) {
+				console.log ('------------------------------- sending message');
+				console.log (JSON.stringify(obj,null,4).slice(0,400));
+			}
 			ws.send(JSON.stringify(obj));
 	    }
   	});
 }
 
 function KBShareManager() {
-	this.addShare=function(share_key,on_message_handler) {addShare(share_key,on_message_handler);};
+	this.addShare=function(share_key,info,on_message_handler) {addShare(share_key,info,on_message_handler);};
 	this.getShare=function(share_key) {return m_shares[share_key]||null;};
 	this.removeShare=function(share_key) {removeShare(share_key);};
+	this.findFileOnShares=function(opts,callback) {findFileOnShares(opts,callback);};
 
 	var m_shares={};
 
-	function addShare(share_key,on_message_handler) {
+	function addShare(share_key,info,on_message_handler) {
 		if (share_key in m_shares) {
 			return;
 		}
-		m_shares[share_key]=new KBShare(share_key,on_message_handler);
+		m_shares[share_key]=new KBShare(share_key,info,on_message_handler);
 	}
 
 	function removeShare(share_key) {
@@ -269,44 +332,94 @@ function KBShareManager() {
 			return;
 		delete m_shares[share_key];
 	}
+
+	function findFileOnShares(opts,callback) {
+		var share_keys=Object.keys(m_shares);
+		console.log('share_keys=',share_keys);
+		var resp={
+			found:false,
+			size:undefined,
+			direct_urls:[],
+			internal_finds:[]
+		};
+		async.eachSeries(share_keys,function(share_key,cb) {
+			var SS=m_shares[share_key];
+			if (!SS) { //maybe it disappeared
+				cb();
+				return;
+			}
+			if (resp.internal_finds.length>=10) {
+				//don't return more than 10
+				cb();
+				return;
+			}
+			console.log('finding file for share_key: '+share_key,opts);
+			SS.findFile(opts,function(err0,resp0) {
+				if ((!err0)&&(resp0.found)) {
+					console.log('Found!!!! --- ',resp0);
+					resp.found=true;
+					resp.size=resp0.size;
+					if (resp0.direct_url) {
+						resp.direct_urls.push(resp0.direct_url);
+					}
+					resp.internal_finds.push({
+						share_key:share_key,
+						path:resp0.path
+					});
+				}
+				cb();
+			});
+		},function() {
+			callback(null,resp);
+		});
+	}
 }
 
-function KBShare(share_key,on_message_handler) {
+function KBShare(share_key,info,on_message_handler) {
 	this.processMessageFromShare=function(msg,callback) {processMessageFromShare(msg,callback);};
 	this.processHttpRequest=function(method,path,req,res) {processHttpRequest(method,path,req,res);};
+	this.findFile=function(opts,callback) {findFile(opts,callback);};
 
 	var m_response_handlers={};
+	var m_indexed_files_by_sha1={};
+	var m_indexed_files_by_path={};
 
-	function processMessageFromShare(msg) {
-		if (msg.command=='http_set_response_headers') {
-			if (!(msg.request_id in m_response_handlers)) {
-				callback('Request id not found (in http_set_response_headers): '+msg.request_id);
-				return;
-			}
-			m_response_handlers[msg.request_id].setResponseHeaders(msg.headers);
+	function processMessageFromShare(msg,callback) {
+		if ((msg.request_id)&&(!(msg.request_id in m_response_handlers))) {
+			callback(`Request id not found (in ${msg.command}): ${msg.request_id}`);
+			return;
+		}
+		if (msg.command=='http_set_response_headers') {	
+			m_response_handlers[msg.request_id].setResponseHeaders(msg.status,msg.status_message,msg.headers);
 		}
 		else if (msg.command=='http_write_response_data') {
-			if (!(msg.request_id in m_response_handlers)) {
-				callback('Request id not found (in http_send_response_data): '+msg.request_id);
-				return;
-			}
 			var data=Buffer.from(msg.data_base64, 'base64');
 			m_response_handlers[msg.request_id].writeResponseData(data);
 		}
 		else if (msg.command=='http_end_response') {
-			if (!(msg.request_id in m_response_handlers)) {
-				callback('Request id not found (in http_end_response): '+msg.request_id);
-				return;
-			}
-			console.log('debug 1 calling endResponse()');
 			m_response_handlers[msg.request_id].endResponse();
 		}
 		else if (msg.command=='http_report_error') {
-			if (!(msg.request_id in m_response_handlers)) {
-				callback('Request id not found (in http_report_error): '+msg.request_id);
-				return;
-			}
 			m_response_handlers[msg.request_id].reportError(msg.error);
+		}
+		else if (msg.command=='set_file_info') {
+			//first remove the old record, if it exists
+			if (msg.path in m_indexed_files_by_path) {
+				var FF=m_indexed_files_by_path[msg.path];
+				delete m_indexed_files_by_sha1[FF.prv.original_checksum];
+				delete m_indexed_files_by_path[msg.path];
+			}
+
+			//now add the new one if the prv is specified
+			if (msg.prv) {
+				var FF={
+					path:msg.path,
+					prv:msg.prv,
+					size:msg.prv.original_size
+				};
+				m_indexed_files_by_path[msg.path]=FF;
+				m_indexed_files_by_sha1[FF.prv.original_checksum]=FF;
+			}
 		}
 		else {
 			callback(`Unrecognized command: ${msg.command}`);
@@ -314,7 +427,6 @@ function KBShare(share_key,on_message_handler) {
 	}
 
 	function processHttpRequest(method,path,req,res) {
-		console.log('processHttpRequest');
 		var req_id=make_random_id(8);
 		m_response_handlers[req_id]={
 			setResponseHeaders:set_response_headers,
@@ -342,25 +454,46 @@ function KBShare(share_key,on_message_handler) {
 				request_id:req_id
 			});
 		});
-		function set_response_headers(headers) {
+		function set_response_headers(status,status_message,headers) {
+			res.status(status,status_message);
+			if ((headers.location)&&(headers.location.startsWith('/'))) {
+				headers.location='/share'+headers.location; //todo: handle this better... rather than hard-coding... on the other hand, this only affects serving web pages
+			}
 			for (var hkey in headers) {
-				console.log('setting header',hkey);
 				res.set(hkey,headers[hkey]);
 			}
 		}
 		function write_response_data(data) {
-			console.log('#################### writing response data...')
 			res.write(data);
 		}
 		function end_response() {
-			console.log('++++++++++++++++++++++++++++++++++ Calling end response in end_response()');
 			res.end();
 		}
 		function report_error(err) {
 			console.error('Error in response: '+err);
-			console.log('++++++++++++++++++++++++++++++++++ Calling end response in report_error()');
 			res.end(); //todo: actually return the error in the proper way
 		}
+	}
+
+	function findFile(opts,callback) {
+		if (!(opts.sha1 in m_indexed_files_by_sha1)) {
+			callback(null,{found:false});
+			return;
+		}
+		var FF=m_indexed_files_by_sha1[opts.sha1];
+		if (!FF) {
+			callback(null,{found:false});
+			return;
+		}
+		var ret={
+			found:true,
+			size:FF.size,
+			path:FF.path
+		};
+		if (info.share_host) {
+			ret.direct_url=`${info.share_protocol}://${info.share_host}:${info.share_port}/${share_key}/download/${FF.path}`;
+		}
+		callback(null,ret);
 	}
 
 	function send_message_to_share(msg) {
@@ -530,19 +663,62 @@ function generate_prv(file, name, size, hash, callback) {
 
 function KBucketHubManager() {
 	this.findFile=function(opts,callback) {findFile(opts,callback);};
+	this.shareManager=function() {return m_share_manager;};
+
+	var m_share_manager=new KBShareManager();
 
 	function findFile(opts,callback) {
 		if (!is_valid_sha1(opts.sha1)) {
 			callback(`Invalid sha1: ${opts.sha1}`);
 			return;
 		}
-		find_file_on_hub(opts,function(err,resp) {
-			if (err) {
-				callback(err);
+		var hub_err=null,hub_resp=null;
+		var shares_err=null,shares_resp=null;
+		async.series([
+			function(cb) {
+				find_file_on_hub(opts,function(err,resp) {
+					hub_err=err;
+					hub_resp=resp||{};
+					cb();
+				});
+			},
+			function(cb) {
+				find_file_on_shares(opts,function(err,resp) {
+					shares_err=err;
+					shares_resp=resp||{};
+					console.log('AAAAAAAAAAAAAAAAAAAAAAAAAa',resp);
+					cb();
+				});
+			}
+		],finalize_find_file);
+
+		function finalize_find_file() {
+			if (hub_err) {
+				console.warn('Problem in find_file_on_hub: '+hub_err);
+			}
+			if (shares_err) {
+				console.warn('Problem in find_file_on_shares: '+hub_err);
+			}
+			if ((hub_err)&&(shares_err)) {
+				callback(`hub error and shares error: ${hub_err}:${shares_err}`);
 				return;
 			}
+			var resp={success:true,found:false};
+			if ((shares_resp.found)||(hub_resp.found)) {
+				resp.found=true;
+				if (shares_resp.found) {
+					resp.direct_urls=shares_resp.direct_urls;
+					resp.size=shares_resp.size;
+				}
+				else if (hub_resp.found) {
+					resp.size=hub_resp.size;
+				}
+				resp.proxy_url=`${KBUCKET_HUB_URL}/proxy-download/${opts.sha1}`;
+				if (opts.filename)
+					resp.proxy_url+=`/${opts.filename}`;
+			}
 			callback(null,resp);
-		});
+		}
 	}
 
 	function find_file_on_hub(opts,callback) {
@@ -552,7 +728,7 @@ function KBucketHubManager() {
 		}
 		var path_on_hub=require('path').join(RAW_DIRECTORY,opts.sha1);
 		if (!fs.existsSync(path_on_hub)) {
-			callback(`File not found: ${opts.sha1}`);
+			callback(null,{found:false,message:`File not found on hub: ${opts.sha1}`});
 			return;
 		}
 		var stat=stat_file(path_on_hub);
@@ -566,8 +742,11 @@ function KBucketHubManager() {
 		}
 		callback(null,{
 			size:stat.size,
-			direct_url:url0
+			url:url0
 		});
+	}
+	function find_file_on_shares(opts,callback) {
+		m_share_manager.findFileOnShares(opts,callback);
 	}
 }
 
