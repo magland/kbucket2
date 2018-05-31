@@ -359,7 +359,6 @@ function KBShareManager() {
 
 	function findFileOnShares(opts,callback) {
 		var share_keys=Object.keys(m_shares);
-		console.log('share_keys=',share_keys);
 		var resp={
 			found:false,
 			size:undefined,
@@ -377,10 +376,8 @@ function KBShareManager() {
 				cb();
 				return;
 			}
-			console.log('finding file for share_key: '+share_key,opts);
 			SS.findFile(opts,function(err0,resp0) {
 				if ((!err0)&&(resp0.found)) {
-					console.log('Found!!!! --- ',resp0);
 					resp.found=true;
 					resp.size=resp0.size;
 					if (resp0.direct_url) {
@@ -710,7 +707,6 @@ function KBucketHubManager() {
 				find_file_on_shares(opts,function(err,resp) {
 					shares_err=err;
 					shares_resp=resp||{};
-					console.log('AAAAAAAAAAAAAAAAAAAAAAAAAa',resp);
 					cb();
 				});
 			}

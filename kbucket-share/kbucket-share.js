@@ -212,7 +212,6 @@ function HttpRequest(on_message_handler) {
       headers:msg.headers,
       followRedirect:false // important because we want the proxy server to handle it instead
     }
-    console.log('opts for request',opts);
     m_request=request(opts);
     m_request.on('response',function(resp) {
       on_message_handler({command:'http_set_response_headers',status:resp.statusCode,status_message:resp.statusMessage,headers:resp.headers});
@@ -398,7 +397,7 @@ function connect_to_websocket() {
     function index_files_list(filepaths,callback) {
       async.eachSeries(filepaths,function(filepath,cb) {
         var path0=require('path').join(share_directory,filepath);
-        console.log(`Computing prv for: ${filepath}...`);
+        console.log (`Computing prv for: ${filepath}...`);
         compute_prv(path0,function(err,prv) {
           if (err) {
             callback(err);
