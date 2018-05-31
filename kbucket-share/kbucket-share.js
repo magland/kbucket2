@@ -7,8 +7,8 @@ const express=require('express');
 const async = require('async');
 
 const KBUCKET_HUB_URL=process.env.KBUCKET_HUB_URL||'https://kbucket.flatironinstitute.org';
-const KBUCKET_SHARE_URL=process.env.KBUCKET_SHARE_URL||'';
-const KBUCKET_SHARE_PORTS=process.env.KBUCKET_SHARE_PORTS||4120;
+const KBUCKET_SHARE_URL=process.env.KBUCKET_SHARE_URL||'http://localhost';
+const KBUCKET_SHARE_PORTS=process.env.KBUCKET_SHARE_PORT||process.env.KBUCKET_SHARE_PORTS||4120;
 
 var CLP=new CLParams(process.argv);
 
@@ -22,20 +22,44 @@ if (!fs.statSync(share_directory).isDirectory()) {
   console.error('Not a directory: '+share_directory);
   process.exit(-1);
 }
+var KBUCKET_SHARE_PORT=KBUCKET_SHARE_PORTS; // TODO: assign open port if this is a range
+
+console.log (`
+Using the following:
+KBUCKET_HUB_URL=${KBUCKET_HUB_URL}
+KBUCKET_SHARE_URL=${KBUCKET_SHARE_URL}
+KBUCKET_SHARE_PORT=${KBUCKET_SHARE_PORT}
+
+Sharing directory: ${share_directory}
+
+`);
+
+// ===================================================== //
 
 const app = express();
 app.set('json spaces', 4); // when we respond with json, this is how it will be formatted
 
+// API readdir
 app.get('/api/readdir/:subdirectory(*)',function(req,res) {
   var params=req.params;
   console.log(params);
   handle_readdir(params.subdirectory,req,res);
 });
-
 app.get('/api/readdir/',function(req,res) {
   var params=req.params;
   handle_readdir('',req,res);
 });
+
+// API download
+app.get('/download/:filename(*)',function(req,res) {
+  var params=req.params;
+  handle_download(params.filename,req,res);
+});
+
+// API web
+app.use('/web', express.static(__dirname+'/web'));
+
+// ===================================================== //
   
 function handle_readdir(subdirectory,req,res) {
   if (!is_safe_path(subdirectory)) {
@@ -78,25 +102,23 @@ function handle_readdir(subdirectory,req,res) {
   });
 }
 
-app.get('/download/:filename(*)',function(req,res) {
-  var params=req.params;
-  if (!is_safe_path(params.filename)) {
-    res.json({success:false,error:'Unsafe path: '+params.filename});
+function handle_download(filename,req,res) {
+  // don't worry too much because express takes care of this below (b/c we specify a root directory)
+  if (!is_safe_path(filename)) {
+    res.json({success:false,error:'Unsafe path: '+filename});
     return;
   }
-  var path0=require('path').join(share_directory,params.filename);
+  var path0=require('path').join(share_directory,filename);
   if (!fs.existsSync(path0)) {
-    res.json({success:false,error:'File does not exist: '+params.filename});
+    res.json({success:false,error:'File does not exist: '+filename});
     return;
   }
   if (!fs.statSync(path0).isFile()) {
-    res.json({success:false,error:'Not a file: '+params.filename});
+    res.json({success:false,error:'Not a file: '+filename});
     return;
   }
-  res.sendFile(params.filename,{dotfiles:'allow',root:share_directory});
-});
-
-app.use('/web', express.static('web'));
+  res.sendFile(filename,{dotfiles:'allow',root:share_directory});
+}
 
 function is_safe_path(path) {
   var list=path.split('/');
@@ -108,9 +130,9 @@ function is_safe_path(path) {
 }
 
 function start_server(callback) {
-  var port=KBUCKET_SHARE_PORTS;
-  app.listen(port, function() {
-    console.log (`Listening on port ${port}`);
+  app.listen(KBUCKET_SHARE_PORT, function() {
+    console.log (`Listening on port ${KBUCKET_SHARE_PORT}`);
+    console.log (`Web interface: ${KBUCKET_SHARE_URL}:${KBUCKET_SHARE_PORT}/web`)
   });
 }
 

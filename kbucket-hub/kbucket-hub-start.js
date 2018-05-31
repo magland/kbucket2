@@ -33,21 +33,63 @@ const UPLOADS_IN_PROGRESS_DIRECTORY = require('path').join(DATA_DIRECTORY, 'uplo
 const MAX_UPLOAD_SIZE_MB=Number(process.env.MAX_UPLOAD_SIZE_MB||1024);
 const KBUCKET_HUB_URL=process.env.KBUCKET_HUB_URL||'https://kbucket.flatironinstitute.org';
 
+console.log (`
+Using the following:
+PORT=${PORT}
+DATA_DIRECTORY=${DATA_DIRECTORY}
+MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB}
+KBUCKET_HUB_URL=${KBUCKET_HUB_URL}
+
+`);
+
 const PRV_HASH = 'sha1',
     PRV_HEAD_LEN = 1000;
 
 mkdir_if_needed(RAW_DIRECTORY);
 mkdir_if_needed(UPLOADS_IN_PROGRESS_DIRECTORY);
 
+// API find
+app.use('/find/:sha1', function(req, res) {
+	var params = req.params;
+	handle_find(params.sha1,'',req,res);
+}
+app.use('/find/:sha1/:filename(*)', function(req, res) {
+	// Note: filename is just for convenience, only used in forming download urls
+	var params = req.params;
+	handle_find(params.sha1,params.filename,req,res);
+}
+// Provide stat synonym for backward-compatibility)
 app.use('/stat/:sha1', function(req, res) {
+	var params = req.params;
+	handle_find(params.sha1,'',req,res);
+}
+
+// API download (direct from kbucket hub)
+app.use('/download/:sha1', function(req, res) {
+	var params = req.params;
+	handle_download(params.sha1,params.sha1,req,res);
+}
+app.use('/download/:sha1/:filename(*)', function(req, res) {
+	// Note: filename is just for convenience, not actually used
+	var params = req.params;
+	handle_download(params.sha1,params.filename,req,res);
+}
+
+// API upload
+app.post('/upload', handle_upload);
+
+// API web
+app.use('/web', express.static(__dirname + '/web'))
+
+function handle_find(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
         allow_cross_domain_requests(res);
-    } else if (req.method == 'GET') {
-        var params = req.params;
-        console.log(`stat: sha1=${params.sha1}`)
+    } else if (req.method == 'GET') {        
+        console.log(`find: sha1=${sha1}`)
 
         KHM.findFile({
-            sha1: params.sha1
+            sha1: sha1,
+            filename: filename
         }, function(err, resp) {
             if (err) {
                 res.json({
@@ -60,8 +102,8 @@ app.use('/stat/:sha1', function(req, res) {
                     success: true,
                     found: true,
                     size: resp.size,
-                    url: resp.url,
-                    alt_urls: resp.alt_urls || []
+                    direct_url: resp.direct_url,
+                    proxy_url: resp.proxy_url||''
                 });
             }
         });
@@ -73,12 +115,11 @@ app.use('/stat/:sha1', function(req, res) {
     }
 });
 
-app.use('/download/:sha1/:filename', function(req, res) {
+function handle_download(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
         allow_cross_domain_requests(res);
     } else if (req.method == 'GET') {
-        var params = req.params;
-        console.log(`download: sha1=${params.sha1}`)
+        console.log (`download: sha1=${params.sha1}`)
 
         if (!is_valid_sha1(params.sha1)) {
             const errstr = `Invalid sha1 for download: ${filename}`;
@@ -94,9 +135,7 @@ app.use('/download/:sha1/:filename', function(req, res) {
     }
 });
 
-app.post('/upload', handle_upload);
 
-app.use('/web', express.static(__dirname + '/web'))
 
 function allow_cross_domain_requests(res) {
     //allow cross-domain requests
@@ -274,18 +313,38 @@ function KBucketHubManager() {
 			callback(`Invalid sha1: ${opts.sha1}`);
 			return;
 		}
-		var path=require('path').join(RAW_DIRECTORY,opts.sha1);
-		if (!fs.existsSync(path)) {
+		find_file_on_hub(opts,function(err,resp) {
+			if (err) {
+				callback(err);
+				return;
+			}
+			callback(null,resp);
+		});
+	}
+
+	function find_file_on_hub(opts,callback) {
+		if (!KBUCKET_HUB_URL) {
+			callback('KBUCKET_HUB_URL not set.');
+			return;
+		}
+		var path_on_hub=require('path').join(RAW_DIRECTORY,opts.sha1);
+		if (!fs.existsSync(path_on_hub)) {
 			callback(`File not found: ${opts.sha1}`);
 			return;
 		}
-		var stat=stat_file(path);
+		var stat=stat_file(path_on_hub);
 		if (!stat) {
 			callback(`Unable to stat file: ${opts.sha1}`);
 			return;
 		}
-		var url0=`${KBUCKET_HUB_URL}/download/${opts.sha1}/test`;
-		callback(null,{size:stat.size,url:url0,alt_urls:[]});
+		var url0=`${KBUCKET_HUB_URL}/download/${opts.sha1}`;
+		if (opts.filename) {
+			url0+='/'+opts.filename;
+		}
+		callback(null,{
+			size:stat.size,
+			direct_url:url0
+		});
 	}
 }
 
