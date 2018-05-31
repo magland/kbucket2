@@ -223,13 +223,37 @@ async.series([
     start_server
 ]);
 
+var USING_HTTPS=false;
+
 function start_server(callback) {
+	app.set('port',PORT);
+	//const port=app.get('port');
+	if (process.env.SSL != null ? process.env.SSL : PORT%1000==443) {
+		USING_HTTPS=true;
+		const options = {
+			key:fs.readFileSync(__dirname+'/../encryption/privkey.pem'),
+			cert:fs.readFileSync(__dirname+'/../encryption/fullchain.pem'),
+			ca:fs.readFileSync(__dirname+'/../encryption/chain.pem')
+		};
+
+		app.server=require('https').createServer(options,app);
+		app.server.listen(PORT,function() {
+			console.info('kbucket2 hub is running https on port', PORT);
+			start_websocket_server();
+		});
+	}
+	else {
+	  	app.server=require('http').createServer(app); //todo: support https when that is being used
+	    app.server.listen(PORT, function() {
+	        console.log ('kbucket2 hub is running http on port', PORT);
+	        start_websocket_server();
+	    });
+	}
+
+	/*
     // Start Server
-    app.server=require('http').createServer(app); //todo: support https when that is being used
-    app.server.listen(PORT, function() {
-        console.log (`Listening on port ${PORT}`);
-        start_websocket_server();
-    });
+    
+    */
 }
 
 function start_websocket_server() {
