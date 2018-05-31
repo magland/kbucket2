@@ -4,10 +4,12 @@ require('dotenv').config({
 
 const fs=require('fs');
 const express=require('express');
+const request=require('request');
 const async = require('async');
+const WebSocket = require('ws');
 
 const KBUCKET_HUB_URL=process.env.KBUCKET_HUB_URL||'https://kbucket.flatironinstitute.org';
-const KBUCKET_SHARE_URL=process.env.KBUCKET_SHARE_URL||'http://localhost';
+const KBUCKET_SHARE_HOST=process.env.KBUCKET_SHARE_HOST||'http://localhost';
 const KBUCKET_SHARE_PORTS=process.env.KBUCKET_SHARE_PORT||process.env.KBUCKET_SHARE_PORTS||4120;
 
 var CLP=new CLParams(process.argv);
@@ -23,12 +25,14 @@ if (!fs.statSync(share_directory).isDirectory()) {
   process.exit(-1);
 }
 var KBUCKET_SHARE_PORT=KBUCKET_SHARE_PORTS; // TODO: assign open port if this is a range
+var KBUCKET_SHARE_KEY=process.env.KBUCKET_SHARE_KEY||make_random_id(8);
 
 console.log (`
 Using the following:
 KBUCKET_HUB_URL=${KBUCKET_HUB_URL}
-KBUCKET_SHARE_URL=${KBUCKET_SHARE_URL}
+KBUCKET_SHARE_HOST=${KBUCKET_SHARE_HOST}
 KBUCKET_SHARE_PORT=${KBUCKET_SHARE_PORT}
+KBUCKET_SHARE_KEY=${KBUCKET_SHARE_KEY}
 
 Sharing directory: ${share_directory}
 
@@ -40,27 +44,42 @@ const app = express();
 app.set('json spaces', 4); // when we respond with json, this is how it will be formatted
 
 // API readdir
-app.get('/api/readdir/:subdirectory(*)',function(req,res) {
+app.get('/:share_key/api/readdir/:subdirectory(*)',function(req,res) {
+  if (!check_share_key(req,res)) return;
   var params=req.params;
   console.log(params);
   handle_readdir(params.subdirectory,req,res);
 });
-app.get('/api/readdir/',function(req,res) {
+app.get('/:share_key/api/readdir/',function(req,res) {
+  if (!check_share_key(req,res)) return;
   var params=req.params;
   handle_readdir('',req,res);
 });
 
 // API download
-app.get('/download/:filename(*)',function(req,res) {
+app.get('/:share_key/download/:filename(*)',function(req,res) {
+  if (!check_share_key(req,res)) return;
   var params=req.params;
   handle_download(params.filename,req,res);
 });
 
 // API web
-app.use('/web', express.static(__dirname+'/web'));
+// don't really need to check the share key here because we won't be able to get anything except in the web/ directory
+app.use('/:share_key/web', express.static(__dirname+'/web'));
 
 // ===================================================== //
-  
+
+
+
+function check_share_key(req,res) {
+  var params=req.params;
+  if (params.share_key!=KBUCKET_SHARE_KEY) {
+    res.json({success:false,error:`Incorrect kbucket share key: ${params.share_key}`});
+    return false;
+  }
+  return true;
+}
+
 function handle_readdir(subdirectory,req,res) {
   if (!is_safe_path(subdirectory)) {
     res.json({success:false,error:'Unsafe path: '+subdirectory});
@@ -132,11 +151,166 @@ function is_safe_path(path) {
 function start_server(callback) {
   app.listen(KBUCKET_SHARE_PORT, function() {
     console.log (`Listening on port ${KBUCKET_SHARE_PORT}`);
-    console.log (`Web interface: ${KBUCKET_SHARE_URL}:${KBUCKET_SHARE_PORT}/web`)
+    console.log (`Web interface: ${KBUCKET_SHARE_HOST}:${KBUCKET_SHARE_PORT}/${KBUCKET_SHARE_KEY}/web`)
+    connect_to_websocket();
   });
 }
 
+var HTTP_REQUESTS={};
+
+function HttpRequest(on_message_handler) {
+  this.initiateRequest=function(msg) {initiateRequest(msg);};
+  this.writeRequestData=function(data) {writeRequestData(data);};
+  this.endRequest=function() {endRequest();};
+
+  var m_request=null;
+
+  function initiateRequest(msg) {
+    /*
+    var opts={
+      method:msg.method,
+      hostname:'localhost',
+      port:KBUCKET_SHARE_PORT,
+      path:msg.path,
+      headers:msg.headers
+    };
+    */
+    var opts={
+      method:msg.method,
+      uri:`http://localhost:${KBUCKET_SHARE_PORT}/${msg.path}`,
+      headers:msg.headers
+    }
+    console.log('opts:',opts);
+    m_request=request(opts);
+    m_request.on('response',function(resp) {
+      console.log('on_response');
+      on_message_handler({command:'http_set_response_headers',headers:resp.headers});
+      resp.on('error',on_response_error);
+      resp.on('data',on_response_data);
+      resp.on('end',on_response_end);
+    });
+    m_request.on('error',function(err) {
+      on_message_handler({command:'http_report_error',error:'Error in request: '+err.message});
+    });
+  }
+
+  function writeRequestData(data) {
+    if (!m_request) {
+      console.error('Unexpected: m_request is null in writeRequestData.');
+      return;
+    }
+    m_request.write(data);
+  }
+
+  function endRequest() {
+    if (!m_request) {
+      console.error('Unexpected: m_request is null in endRequest.');
+      return;
+    }
+    m_request.end();
+  }
+
+  function on_response_data(data) {
+    console.log('on_response_data');
+    on_message_handler({
+      command:'http_write_response_data',
+      data_base64:data.toString('base64')
+    });
+  }
+
+  function on_response_end() {
+    console.log('on_response_end');
+    on_message_handler({
+      command:'http_end_response'
+    });
+  }
+
+  function on_response_error(err) {
+    console.log('on_response_error');
+    on_message_handler({
+      command:'http_report_error',
+      error:'Error in response: '+err.message
+    });
+  }
+}
+
+function connect_to_websocket() {
+  if (KBUCKET_HUB_URL) {
+    var URL=require('url').URL;
+    var url=new URL(KBUCKET_HUB_URL);
+    url.protocol='ws';
+    url=url.toString();
+    const ws = new WebSocket(url, {
+      perMessageDeflate: false
+    });
+    ws.on('open', function open() {
+      send_message_to_hub({
+        command:'register_kbucket_share',
+        share_host:KBUCKET_SHARE_HOST,
+        share_port:KBUCKET_SHARE_PORT
+      });
+    });
+    ws.on('message', (message_str) => {
+      var msg=parse_json(message_str);
+      if (!msg) {
+        console.log ('Unable to parse message. Closing websocket.');
+        ws.close();
+        return;
+      }
+      console.log('====================================== received message');
+      console.log(JSON.stringify(msg,null,4));
+
+      if (msg.command=='http_initiate_request') {
+        if (msg.request_id in HTTP_REQUESTS) {
+          console.log (`Request with id=${msg.request_id} already exists (in http_initiate_request). Closing websocket.`);
+          ws.close();
+          return;   
+        }
+        HTTP_REQUESTS[msg.request_id]=new HttpRequest(function(msg_to_hub) {
+          msg_to_hub.request_id=msg.request_id;
+          send_message_to_hub(msg_to_hub);
+        });
+        HTTP_REQUESTS[msg.request_id].initiateRequest(msg);
+      }
+      else if (msg.command=='http_write_request_data') {
+        if (!(msg.request_id in HTTP_REQUESTS)) {
+          console.log (`No request found with id=${msg.request_id} (in http_write_request_data). Closing websocket.`);
+          ws.close();
+          return;  
+        }
+        var REQ=HTTP_REQUESTS[msg.request_id];
+        var data=Buffer.from(msg.data_base64, 'base64');
+        REQ.writeRequestData(data);
+      }
+      else if (msg.command=='http_end_request') {
+        if (!(msg.request_id in HTTP_REQUESTS)) {
+          console.log (`No request found with id=${msg.request_id} (in http_end_request). Closing websocket.`);
+          ws.close();
+          return;  
+        }
+        var REQ=HTTP_REQUESTS[msg.request_id];
+        REQ.endRequest();
+      }
+      else {
+        console.log (`Unexpected command: ${msg.command}. Closing websocket.`);
+        ws.close();
+        return;  
+      }
+    });
+    function send_message_to_hub(obj) {
+      obj.share_key=KBUCKET_SHARE_KEY;
+      send_json_message(obj);
+    }
+    function send_json_message(obj) {
+      console.log('------------------------------- sending message');
+      console.log(JSON.stringify(obj,null,4));
+      ws.send(JSON.stringify(obj));
+    }
+  }
+}
+
 start_server();
+
 
 
 function CLParams(argv) {
@@ -172,3 +346,22 @@ function CLParams(argv) {
     }
   }
 };
+
+function make_random_id(len) {
+    var text = "";
+    var possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    for( var i=0; i < len; i++ )
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+
+    return text;
+}
+
+function parse_json(str) {
+  try {
+    return JSON.parse(str);
+  }
+  catch(err) {
+    return null;
+  }
+}

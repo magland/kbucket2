@@ -18,6 +18,7 @@ const sanitize = require('sanitize-filename');
 const fs = require('fs');
 const crypto = require('crypto');
 const assert = require('assert');
+const WebSocket = require('ws');
 
 const express = require('express');
 const app = express();
@@ -52,28 +53,34 @@ mkdir_if_needed(UPLOADS_IN_PROGRESS_DIRECTORY);
 app.use('/find/:sha1', function(req, res) {
 	var params = req.params;
 	handle_find(params.sha1,'',req,res);
-}
+});
 app.use('/find/:sha1/:filename(*)', function(req, res) {
 	// Note: filename is just for convenience, only used in forming download urls
 	var params = req.params;
 	handle_find(params.sha1,params.filename,req,res);
-}
+});
 // Provide stat synonym for backward-compatibility)
 app.use('/stat/:sha1', function(req, res) {
 	var params = req.params;
 	handle_find(params.sha1,'',req,res);
-}
+});
 
 // API download (direct from kbucket hub)
 app.use('/download/:sha1', function(req, res) {
 	var params = req.params;
 	handle_download(params.sha1,params.sha1,req,res);
-}
+});
 app.use('/download/:sha1/:filename(*)', function(req, res) {
 	// Note: filename is just for convenience, not actually used
 	var params = req.params;
 	handle_download(params.sha1,params.filename,req,res);
-}
+});
+
+// Forward http request to a kbucket share
+app.use('/share/:share_key/:path(*)', function(req, res) {
+	var params = req.params;
+	handle_forward_to_share(params.share_key,req.method,params.path,req,res);
+});
 
 // API upload
 app.post('/upload', handle_upload);
@@ -113,7 +120,7 @@ function handle_find(sha1,filename,req,res) {
             error: 'Unsupported method: ' + req.method
         });
     }
-});
+}
 
 function handle_download(sha1,filename,req,res) {
     if (req.method == 'OPTIONS') {
@@ -133,9 +140,17 @@ function handle_download(sha1,filename,req,res) {
     } else {
         res.end('Unsupported method: ' + req.method);
     }
-});
+}
 
-
+function handle_forward_to_share(share_key,method,path,req,res) {
+	//allow_cross_domain_requests(res);
+	var SS=KBSM.getShare(share_key);
+	if (!SS) {
+		res.json({success:false,error:`Unable to find share with key=${share_key}`});
+		return;
+	}
+	SS.processHttpRequest(method,path,req,res);
+}
 
 function allow_cross_domain_requests(res) {
     //allow cross-domain requests
@@ -154,10 +169,218 @@ async.series([
 
 function start_server(callback) {
     // Start Server
-    app.listen(PORT, function() {
+    app.server=require('http').createServer(app); //todo: support https when that is being used
+    app.server.listen(PORT, function() {
         console.log(`Listening on port ${PORT}`);
+        start_websocket_server();
     });
 }
+
+const KBSM=new KBShareManager();
+
+function start_websocket_server() {
+	//initialize the WebSocket server instance
+	const wss = new WebSocket.Server({server:app.server});
+
+	wss.on('connection', (ws) => {
+		var share_key='';
+		ws.on('message', (message_str) => {
+			var msg=parse_json(message_str);
+			console.log('====================================== received message');
+			console.log(JSON.stringify(msg,null,4));
+			if (!msg) {
+				console.log ('Invalid message. Closing websocket connection.');
+				ws.close();
+				return;
+			}
+			if ((share_key)&&(msg.share_key!=share_key)) {
+				console.log ('Share key does not match. Closing websocket connection.');
+				ws.close();
+				return;
+			}
+			if (msg.command=='register_kbucket_share') {
+				if (!is_valid_share_key(msg.share_key||'')) {
+					console.log ('Invalid share key. Closing websocket connection');
+					ws.close();
+					return;
+				}
+				share_key=msg.share_key;
+				if (KBSM.getShare(share_key)) {
+					console.log ('A share with this key already exists. Closing websocket connection.');
+					ws.close();
+					return;
+				}
+				console.log ('Registering',JSON.stringify(msg,null,4));
+				KBSM.addShare(share_key,send_message_to_share);
+			}
+			else {
+				var SS=KBSM.getShare(share_key);
+				if (!SS) {
+					console.log (`Unable to find share with key=${share_key}. Closing websocket connect.`);
+					ws.close();
+					return;
+				}
+				SS.processMessageFromShare(msg,function(err,response) {
+					if (err) {
+						console.log (`${err}. Closing websocket connection.`);
+						ws.close();
+						return;
+					}
+					if (response) {
+						send_json_message(response);
+					}
+				});
+			}
+		});
+
+		ws.on('close',function() {
+			console.log(`Websocket closed: share_key=${share_key}`);
+			KBSM.removeShare(share_key);
+		});
+
+		function send_message_to_share(obj) {
+			send_json_message(obj);
+		}
+
+		function send_json_message(obj) {
+			console.log('------------------------------- sending message');
+			console.log(JSON.stringify(obj,null,4));
+			ws.send(JSON.stringify(obj));
+	    }
+  	});
+}
+
+function KBShareManager() {
+	this.addShare=function(share_key,on_message_handler) {addShare(share_key,on_message_handler);};
+	this.getShare=function(share_key) {return m_shares[share_key]||null;};
+	this.removeShare=function(share_key) {removeShare(share_key);};
+
+	var m_shares={};
+
+	function addShare(share_key,on_message_handler) {
+		if (share_key in m_shares) {
+			return;
+		}
+		m_shares[share_key]=new KBShare(share_key,on_message_handler);
+	}
+
+	function removeShare(share_key) {
+		if (!(share_key in m_shares))
+			return;
+		delete m_shares[share_key];
+	}
+}
+
+function KBShare(share_key,on_message_handler) {
+	this.processMessageFromShare=function(msg,callback) {processMessageFromShare(msg,callback);};
+	this.processHttpRequest=function(method,path,req,res) {processHttpRequest(method,path,req,res);};
+
+	var m_response_handlers={};
+
+	function processMessageFromShare(msg) {
+		if (msg.command=='http_set_response_headers') {
+			if (!(msg.request_id in m_response_handlers)) {
+				callback('Request id not found (in http_set_response_headers): '+msg.request_id);
+				return;
+			}
+			m_response_handlers[msg.request_id].setResponseHeaders(msg.headers);
+		}
+		else if (msg.command=='http_write_response_data') {
+			if (!(msg.request_id in m_response_handlers)) {
+				callback('Request id not found (in http_send_response_data): '+msg.request_id);
+				return;
+			}
+			var data=Buffer.from(msg.data_base64, 'base64');
+			m_response_handlers[msg.request_id].writeResponseData(data);
+		}
+		else if (msg.command=='http_end_response') {
+			if (!(msg.request_id in m_response_handlers)) {
+				callback('Request id not found (in http_end_response): '+msg.request_id);
+				return;
+			}
+			console.log('debug 1 calling endResponse()');
+			m_response_handlers[msg.request_id].endResponse();
+		}
+		else if (msg.command=='http_report_error') {
+			if (!(msg.request_id in m_response_handlers)) {
+				callback('Request id not found (in http_report_error): '+msg.request_id);
+				return;
+			}
+			m_response_handlers[msg.request_id].reportError(msg.error);
+		}
+		else {
+			callback(`Unrecognized command: ${msg.command}`);
+		}
+	}
+
+	function processHttpRequest(method,path,req,res) {
+		console.log('processHttpRequest');
+		var req_id=make_random_id(8);
+		m_response_handlers[req_id]={
+			setResponseHeaders:set_response_headers,
+			writeResponseData:write_response_data,
+			endResponse:end_response,
+			reportError:report_error
+		};
+		send_message_to_share({
+			command:'http_initiate_request',
+			method:req.method,
+			path:share_key+'/'+path,
+			headers:req.headers,
+			request_id:req_id
+		});
+		req.on('data',function(data) {
+			send_message_to_share({
+				command:'http_write_request_data',
+				data_base64:data.toString('base64'),
+				request_id:req_id
+			});
+		});
+		req.on('end',function() {
+			send_message_to_share({
+				command:'http_end_request',
+				request_id:req_id
+			});
+		});
+		function set_response_headers(headers) {
+			for (var hkey in headers) {
+				console.log('setting header',hkey);
+				res.set(hkey,headers[hkey]);
+			}
+		}
+		function write_response_data(data) {
+			console.log('#################### writing response data...')
+			res.write(data);
+		}
+		function end_response() {
+			console.log('++++++++++++++++++++++++++++++++++ Calling end response in end_response()');
+			res.end();
+		}
+		function report_error(err) {
+			console.error('Error in response: '+err);
+			console.log('++++++++++++++++++++++++++++++++++ Calling end response in report_error()');
+			res.end(); //todo: actually return the error in the proper way
+		}
+	}
+
+	function send_message_to_share(msg) {
+		on_message_handler(msg);
+	}
+}
+
+function parse_json(str) {
+	try {
+		return JSON.parse(str);
+	}
+	catch(err) {
+		return null;
+	}
+}
+
+function is_valid_share_key(key) {
+	return ((8<=key.length)&&(key.length<=64));
+}
+
 
 function is_valid_sha1(sha1) {
     if (sha1.match(/\b([a-f0-9]{40})\b/))
@@ -348,3 +571,12 @@ function KBucketHubManager() {
 	}
 }
 
+function make_random_id(len) {
+    var text = "";
+    var possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+    for( var i=0; i < len; i++ )
+        text += possible.charAt(Math.floor(Math.random() * possible.length));
+
+    return text;
+}
