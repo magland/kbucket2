@@ -145,14 +145,14 @@ function handle_download(sha1,filename,req,res) {
     if (req.method == 'GET') {
         console.log (`download: sha1=${sha1}`)
 
-        if (!is_valid_sha1(params.sha1)) {
+        if (!is_valid_sha1(sha1)) {
             const errstr = `Invalid sha1 for download: ${filename}`;
             console.error(errstr);
             res.end(errstr);
             return;
         }
 
-        var path_to_file = RAW_DIRECTORY + '/' + params.sha1;
+        var path_to_file = RAW_DIRECTORY + '/' + sha1;
         res.sendFile(path_to_file);
     } else {
         res.end('Unsupported method: ' + req.method);
